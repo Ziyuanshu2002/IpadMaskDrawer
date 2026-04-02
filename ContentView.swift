@@ -10,8 +10,10 @@
 //  - All labels visible simultaneously as a 50% opacity overlay
 //  - Painting in pixel coordinates (no vector strokes)
 //  - Overlay rendered with NO interpolation (pixelated)
-//  - Save writes ONLY the mask: <folder>/labels/<base>_mask.tif
-//  - Reopening folder auto-loads existing masks
+//  - User picks a main folder, then selects Mask / BF / Fluoro subfolders
+//  - BF and Fluoro frames are matched by the trailing number in the filename stem
+//  - Save writes ONLY the mask: <mask folder>/<base>_mask.tif
+//  - Reopening folder auto-loads existing masks from the selected mask folder
 //
 
 import SwiftUI
@@ -24,9 +26,26 @@ import CoreGraphics
 struct ContentView: View {
     private let labels: [UInt16] = [1, 2, 3, 4, 5]
 
-    @State private var folderURL: URL?
-    @State private var securityScopedFolderURL: URL?
-    @State private var imageURLs: [URL] = []
+    @State private var maskFolderURL: URL?
+    @State private var bfFolderURL: URL?
+    @State private var fluoroFolderURL: URL?
+
+    @State private var securityScopedMaskFolderURL: URL?
+    @State private var securityScopedBFFolderURL: URL?
+    @State private var securityScopedFluoroFolderURL: URL?
+
+    private enum FolderPickTarget {
+        case mask
+        case bf
+        case fluoro
+    }
+    @State private var pickerTarget: FolderPickTarget = .bf
+
+    private struct ImagePair {
+        let bfURL: URL
+        let fluoroURL: URL?
+    }
+    @State private var imagePairs: [ImagePair] = []
     @State private var index: Int = 0
 
     // Current image preview (8-bit display)
@@ -65,15 +84,43 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 10) {
             HStack(spacing: 12) {
-                Button("Choose Folder") { showPicker = true }
-                if let folderURL {
-                    Text(folderURL.lastPathComponent)
+                Button("Choose Mask Folder") {
+                    pickerTarget = .mask
+                    showPicker = true
+                }
+                if let maskFolderURL {
+                    Text(maskFolderURL.lastPathComponent)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
+
                 Spacer()
-                if !imageURLs.isEmpty {
-                    Text("\(index+1)/\(imageURLs.count)")
+
+                Button("Choose BF Folder") {
+                    pickerTarget = .bf
+                    showPicker = true
+                }
+                if let bfFolderURL {
+                    Text(bfFolderURL.lastPathComponent)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                Button("Choose Fluoro Folder") {
+                    pickerTarget = .fluoro
+                    showPicker = true
+                }
+                if let fluoroFolderURL {
+                    Text(fluoroFolderURL.lastPathComponent)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+                if !imagePairs.isEmpty {
+                    Text("\(index+1)/\(imagePairs.count)")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
 
@@ -135,7 +182,7 @@ struct ContentView: View {
                 }
 
                 Button("Prev") { prev() }.disabled(index == 0)
-                Button("Next") { saveAndNext() }.disabled(index >= imageURLs.count - 1)
+                Button("Next") { saveAndNext() }.disabled(index >= imagePairs.count - 1)
             }
 
             ZStack {
@@ -176,7 +223,7 @@ struct ContentView: View {
                         .position(x: fitted.midX, y: fitted.midY)
                     }
                 } else {
-                    Text(folderURL == nil ? "Choose a folder with BF*.tif" : "Loading image…")
+                    Text(bfFolderURL == nil ? "Choose a BF folder" : "Loading image…")
                         .foregroundStyle(.secondary)
                 }
             }
@@ -188,7 +235,7 @@ struct ContentView: View {
                 Button("Clear Mask") { clearCurrentMask() }
                 Spacer()
                 Button("Save Mask TIFF") { saveMaskTiff() }
-                    .disabled(uiImage == nil || folderURL == nil)
+                    .disabled(uiImage == nil || maskFolderURL == nil)
             }
 
             Text(statusText)
@@ -197,25 +244,13 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding()
-        .onAppear {
-            if let url = folderURL {
-                // Ensure access remains open during the session
-                _ = beginSecurityScopedAccess(to: url)
-            }
-        }
         .onDisappear {
-            endSecurityScopedAccess()
+            endAllSecurityScopedAccess()
         }
         .sheet(isPresented: $showPicker) {
             FolderPicker { url in
                 if let url {
-                    // IMPORTANT: needed on real device for folder access
-                    if beginSecurityScopedAccess(to: url) {
-                        folderURL = url
-                        loadFolder(url)
-                    } else {
-                        statusText = "Failed to access folder (permission). Try picking again."
-                    }
+                    handlePickedFolder(url)
                 }
                 showPicker = false
             }
@@ -224,25 +259,45 @@ struct ContentView: View {
 
     // MARK: - Security-scoped access (required on physical devices)
 
-    private func beginSecurityScopedAccess(to url: URL) -> Bool {
-        // If we already have an open security-scoped URL, close it first.
-        if let existing = securityScopedFolderURL {
-            existing.stopAccessingSecurityScopedResource()
-            securityScopedFolderURL = nil
-        }
-
-        // Start access for this session
+    private func setSecurityScopedFolder(_ url: URL, target: FolderPickTarget) -> Bool {
         let ok = url.startAccessingSecurityScopedResource()
-        if ok {
-            securityScopedFolderURL = url
+        guard ok else { return false }
+
+        switch target {
+        case .mask:
+            if let existing = securityScopedMaskFolderURL {
+                existing.stopAccessingSecurityScopedResource()
+            }
+            securityScopedMaskFolderURL = url
+            maskFolderURL = url
+        case .bf:
+            if let existing = securityScopedBFFolderURL {
+                existing.stopAccessingSecurityScopedResource()
+            }
+            securityScopedBFFolderURL = url
+            bfFolderURL = url
+        case .fluoro:
+            if let existing = securityScopedFluoroFolderURL {
+                existing.stopAccessingSecurityScopedResource()
+            }
+            securityScopedFluoroFolderURL = url
+            fluoroFolderURL = url
         }
-        return ok
+        return true
     }
 
-    private func endSecurityScopedAccess() {
-        if let existing = securityScopedFolderURL {
+    private func endAllSecurityScopedAccess() {
+        if let existing = securityScopedMaskFolderURL {
             existing.stopAccessingSecurityScopedResource()
-            securityScopedFolderURL = nil
+            securityScopedMaskFolderURL = nil
+        }
+        if let existing = securityScopedBFFolderURL {
+            existing.stopAccessingSecurityScopedResource()
+            securityScopedBFFolderURL = nil
+        }
+        if let existing = securityScopedFluoroFolderURL {
+            existing.stopAccessingSecurityScopedResource()
+            securityScopedFluoroFolderURL = nil
         }
     }
 
@@ -300,13 +355,29 @@ struct ContentView: View {
         return nil
     }
 
+    private func currentBFURL() -> URL? {
+        guard !imagePairs.isEmpty, index >= 0, index < imagePairs.count else { return nil }
+        return imagePairs[index].bfURL
+    }
+
+    private func currentFluoroURL() -> URL? {
+        guard !imagePairs.isEmpty, index >= 0, index < imagePairs.count else { return nil }
+        return imagePairs[index].fluoroURL
+    }
+
     private func currentImageKey() -> String {
-        guard !imageURLs.isEmpty else { return "" }
-        return imageURLs[index].deletingPathExtension().lastPathComponent
+        guard let url = currentBFURL() else { return "" }
+        return url.deletingPathExtension().lastPathComponent
+    }
+
+    private func trailingFrameNumber(from url: URL) -> Int? {
+        let stem = url.deletingPathExtension().lastPathComponent
+        guard let range = stem.range(of: #"(\d+)$"#, options: .regularExpression) else { return nil }
+        return Int(stem[range])
     }
 
     private func stashCurrentMask() {
-        guard !imageURLs.isEmpty else { return }
+        guard !imagePairs.isEmpty else { return }
         let key = currentImageKey()
         if maskW > 0, maskH > 0, maskData.count == maskW*maskH {
             maskByImage[key] = MaskCacheEntry(w: maskW, h: maskH, data: maskData)
@@ -321,14 +392,14 @@ struct ContentView: View {
     }
 
     private func next() {
-        guard index < imageURLs.count - 1 else { return }
+        guard index < imagePairs.count - 1 else { return }
         stashCurrentMask()
         index += 1
         loadCurrentImage()
     }
 
     private func saveAndNext() {
-        guard index < imageURLs.count - 1 else { return }
+        guard index < imagePairs.count - 1 else { return }
         if autoFloodFill {
             maskData = floodFillEnclosures(in: maskData, width: maskW, height: maskH)
             stashCurrentMask()
@@ -438,15 +509,15 @@ struct ContentView: View {
     }
 
     private func jumpToFrame() {
-        guard !imageURLs.isEmpty else { return }
+        guard !imagePairs.isEmpty else { return }
         guard let oneBased = Int(jumpFrameText.trimmingCharacters(in: .whitespacesAndNewlines)) else {
             statusText = "Enter a valid frame number."
             return
         }
 
         let newIndex = oneBased - 1
-        guard newIndex >= 0 && newIndex < imageURLs.count else {
-            statusText = "Frame out of range. Enter 1–\(imageURLs.count)."
+        guard newIndex >= 0 && newIndex < imagePairs.count else {
+            statusText = "Frame out of range. Enter 1–\(imagePairs.count)."
             return
         }
 
@@ -458,71 +529,87 @@ struct ContentView: View {
 
     // MARK: - Folder / Image loading
 
-    private func loadFolder(_ url: URL) {
-        // On physical devices, folder reads require security-scoped access.
-        if securityScopedFolderURL?.standardizedFileURL != url.standardizedFileURL {
-            _ = beginSecurityScopedAccess(to: url)
+    private func handlePickedFolder(_ url: URL) {
+        if !setSecurityScopedFolder(url, target: pickerTarget) {
+            statusText = "Failed to access folder (permission). Try picking again."
+            return
         }
-        statusText = "Scanning folder…"
-        imageURLs = []
+        rebuildImagePairs()
+    }
+
+    private func rebuildImagePairs() {
+        imagePairs = []
         index = 0
         uiImage = nil
         fluoroImage = nil
-
         maskW = 0
         maskH = 0
         maskData = []
         maskByImage.removeAll()
 
-        let fm = FileManager.default
-        guard let items = try? fm.contentsOfDirectory(at: url, includingPropertiesForKeys: nil) else {
-            statusText = "Failed to read folder."
+        guard let bfFolderURL else {
+            statusText = "Choose a BF folder."
             return
         }
 
-        let tiffs = items.filter { u in
-            let ext = u.pathExtension.lowercased()
-            return ext == "tif" || ext == "tiff"
+        let fm = FileManager.default
+        guard let bfItems = try? fm.contentsOfDirectory(at: bfFolderURL, includingPropertiesForKeys: nil) else {
+            statusText = "Failed to read BF folder."
+            return
         }
-        .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
 
-        imageURLs = tiffs
+        let bfTiffs = bfItems
+            .filter { ["tif", "tiff"].contains($0.pathExtension.lowercased()) }
+            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
 
-        // Preload existing masks if present; otherwise create a blank cache entry for every BF image.
-        for imgURL in imageURLs {
-            let base = imgURL.deletingPathExtension().lastPathComponent
-
-            if let entry = tryLoadMaskFromDisk(folder: url, imageBase: base) {
-                maskByImage[base] = entry
-                continue
-            }
-
-            // No matching mask on disk: create a blank one now so later navigation does not re-check disk.
-            if let preview = readTiffPreview8bitAutoBC(from: imgURL) {
-                let w = Int(preview.pixelSize.width)
-                let h = Int(preview.pixelSize.height)
-                if w > 0, h > 0 {
-                    maskByImage[base] = MaskCacheEntry(
-                        w: w,
-                        h: h,
-                        data: Array(repeating: 0, count: w * h)
-                    )
+        var fluoroByNumber: [Int: URL] = [:]
+        if let fluoroFolderURL,
+           let flItems = try? fm.contentsOfDirectory(at: fluoroFolderURL, includingPropertiesForKeys: nil) {
+            let flTiffs = flItems
+                .filter { ["tif", "tiff"].contains($0.pathExtension.lowercased()) }
+                .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+            for url in flTiffs {
+                if let n = trailingFrameNumber(from: url) {
+                    fluoroByNumber[n] = url
                 }
             }
         }
 
-        statusText = "Found \(tiffs.count) TIFFs."
+        imagePairs = bfTiffs.map { bf in
+            let fluoro = trailingFrameNumber(from: bf).flatMap { fluoroByNumber[$0] }
+            return ImagePair(bfURL: bf, fluoroURL: fluoro)
+        }
+
+        for pair in imagePairs {
+            let base = pair.bfURL.deletingPathExtension().lastPathComponent
+            if let maskFolderURL, let entry = tryLoadMaskFromDisk(folder: maskFolderURL, imageBase: base) {
+                maskByImage[base] = entry
+                continue
+            }
+            if let preview = readTiffPreview8bitAutoBC(from: pair.bfURL) {
+                let w = Int(preview.pixelSize.width)
+                let h = Int(preview.pixelSize.height)
+                if w > 0, h > 0 {
+                    maskByImage[base] = MaskCacheEntry(w: w, h: h, data: Array(repeating: 0, count: w * h))
+                }
+            }
+        }
+
+        statusText = "Loaded \(imagePairs.count) BF frames."
         loadCurrentImage()
     }
 
     private func loadCurrentImage() {
-        guard !imageURLs.isEmpty else { return }
-        let url = imageURLs[index]
-        let key = url.deletingPathExtension().lastPathComponent
+        guard let bfURL = currentBFURL() else { return }
+        let key = bfURL.deletingPathExtension().lastPathComponent
 
-        if let preview = readTiffPreview8bitAutoBC(from: url) {
+        if let preview = readTiffPreview8bitAutoBC(from: bfURL) {
             uiImage = preview.image
-            fluoroImage = loadMatchingFluoroPreview(for: url)
+            if let flURL = currentFluoroURL() {
+                fluoroImage = readTiffPreview8bitAutoBC(from: flURL)?.image
+            } else {
+                fluoroImage = nil
+            }
             imagePixelSize = preview.pixelSize
 
             let w = Int(preview.pixelSize.width)
@@ -539,52 +626,18 @@ struct ContentView: View {
                 maskByImage[key] = MaskCacheEntry(w: w, h: h, data: maskData)
             }
 
-            statusText = "Loaded \(url.lastPathComponent) (\(w)x\(h))"
+            statusText = "Loaded \(bfURL.lastPathComponent) (\(w)x\(h))"
         } else {
             uiImage = nil
             fluoroImage = nil
             maskW = 0
             maskH = 0
             maskData = []
-            statusText = "Failed to load \(url.lastPathComponent)"
+            statusText = "Failed to load \(bfURL.lastPathComponent)"
         }
     }
 
-    private func matchingFluoroURL(for bfURL: URL) -> URL? {
-        let folder = bfURL.deletingLastPathComponent()
-        let name = bfURL.deletingPathExtension().lastPathComponent
 
-        // Match BF8 -> Fluoro8, BF08 -> Fluoro08, etc.
-        if let m = name.range(of: #"^BF(\d+)$"#, options: .regularExpression) {
-            let digits = String(name[m]).replacingOccurrences(of: "BF", with: "")
-            let candidates = [
-                folder.appendingPathComponent("Fluoro\(digits).tif"),
-                folder.appendingPathComponent("Fluoro\(digits).tiff")
-            ]
-            for url in candidates where FileManager.default.fileExists(atPath: url.path) {
-                return url
-            }
-        }
-
-        // Fallback: try replacing a leading BF with Fluoro in the filename stem.
-        if name.hasPrefix("BF") {
-            let replaced = "Fluoro" + name.dropFirst(2)
-            let candidates = [
-                folder.appendingPathComponent("\(replaced).tif"),
-                folder.appendingPathComponent("\(replaced).tiff")
-            ]
-            for url in candidates where FileManager.default.fileExists(atPath: url.path) {
-                return url
-            }
-        }
-
-        return nil
-    }
-
-    private func loadMatchingFluoroPreview(for bfURL: URL) -> UIImage? {
-        guard let fluoroURL = matchingFluoroURL(for: bfURL) else { return nil }
-        return readTiffPreview8bitAutoBC(from: fluoroURL)?.image
-    }
 
     // MARK: - Mask ops
 
@@ -595,7 +648,7 @@ struct ContentView: View {
     }
 
     private func saveMaskTiff() {
-        guard let folderURL, !imageURLs.isEmpty else { return }
+        guard let maskFolderURL else { return }
         let key = currentImageKey()
 
         if autoFloodFill {
@@ -603,9 +656,8 @@ struct ContentView: View {
         }
         stashCurrentMask()
 
-        let outDir = folderURL.appendingPathComponent("labels", isDirectory: true)
-        try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
-        let outURL = outDir.appendingPathComponent("\(key)_mask.tif")
+        try? FileManager.default.createDirectory(at: maskFolderURL, withIntermediateDirectories: true)
+        let outURL = maskFolderURL.appendingPathComponent("\(key)_mask.tif")
 
         guard maskW > 0, maskH > 0, maskData.count == maskW*maskH else {
             statusText = "Invalid mask size."
@@ -614,7 +666,7 @@ struct ContentView: View {
 
         do {
             try writeUInt16TiffGray(label: maskData, width: maskW, height: maskH, to: outURL)
-            statusText = "Saved mask: labels/\(outURL.lastPathComponent)"
+            statusText = "Saved mask: \(outURL.lastPathComponent)"
         } catch {
             statusText = "Save failed: \(error.localizedDescription)"
         }
