@@ -31,6 +31,11 @@ struct ContentView: View {
 
     // Current image preview (8-bit display)
     @State private var uiImage: UIImage?
+    @State private var fluoroImage: UIImage?
+    @State private var showFluoro: Bool = false
+    @State private var bfOpacity: Double = 1.0
+    @State private var fluoroOpacity: Double = 0.55
+    @State private var maskOpacity: Double = 0.50
     @State private var imagePixelSize: CGSize = .zero
 
     // Current per-image mask (UInt16 labels, length = w*h)
@@ -104,7 +109,30 @@ struct ContentView: View {
 
                 Button(pencilOnly ? "Pencil Only ✓" : "Pencil Only") { pencilOnly.toggle() }
 
+                Button(showFluoro ? "Fluoro ✓" : "Fluoro") { showFluoro.toggle() }
+
                 Button(autoFloodFill ? "Auto Fill ✓" : "Auto Fill") { autoFloodFill.toggle() }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("BF \(Int(round(bfOpacity * 100)))%")
+                        .font(.caption2)
+                    Slider(value: $bfOpacity, in: 0...1)
+                        .frame(width: 110)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Fluoro \(Int(round(fluoroOpacity * 100)))%")
+                        .font(.caption2)
+                    Slider(value: $fluoroOpacity, in: 0...1)
+                        .frame(width: 110)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Mask \(Int(round(maskOpacity * 100)))%")
+                        .font(.caption2)
+                    Slider(value: $maskOpacity, in: 0...1)
+                        .frame(width: 110)
+                }
 
                 Button("Prev") { prev() }.disabled(index == 0)
                 Button("Next") { saveAndNext() }.disabled(index >= imageURLs.count - 1)
@@ -121,6 +149,17 @@ struct ContentView: View {
                             .aspectRatio(contentMode: .fit)
                             .frame(width: geo.size.width, height: geo.size.height)
                             .clipped()
+                            .opacity(bfOpacity)
+
+                        // Optional fluorescent layer (same fitted rect as BF)
+                        if showFluoro, let fluoroImage {
+                            Image(uiImage: fluoroImage)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(width: geo.size.width, height: geo.size.height)
+                                .clipped()
+                                .opacity(fluoroOpacity)
+                        }
 
                         // Mask overlay + painter (only on fitted rect)
                         PixelMaskPainterRepresentable(
@@ -130,7 +169,8 @@ struct ContentView: View {
                             activeLabel: $activeLabel,
                             brushWidthPx: $brushWidthPx,
                             eraserMode: $eraserMode,
-                            pencilOnly: $pencilOnly
+                            pencilOnly: $pencilOnly,
+                            overlayOpacity: $maskOpacity
                         )
                         .frame(width: fitted.width, height: fitted.height)
                         .position(x: fitted.midX, y: fitted.midY)
@@ -427,6 +467,7 @@ struct ContentView: View {
         imageURLs = []
         index = 0
         uiImage = nil
+        fluoroImage = nil
 
         maskW = 0
         maskH = 0
@@ -481,6 +522,7 @@ struct ContentView: View {
 
         if let preview = readTiffPreview8bitAutoBC(from: url) {
             uiImage = preview.image
+            fluoroImage = loadMatchingFluoroPreview(for: url)
             imagePixelSize = preview.pixelSize
 
             let w = Int(preview.pixelSize.width)
@@ -500,11 +542,48 @@ struct ContentView: View {
             statusText = "Loaded \(url.lastPathComponent) (\(w)x\(h))"
         } else {
             uiImage = nil
+            fluoroImage = nil
             maskW = 0
             maskH = 0
             maskData = []
             statusText = "Failed to load \(url.lastPathComponent)"
         }
+    }
+
+    private func matchingFluoroURL(for bfURL: URL) -> URL? {
+        let folder = bfURL.deletingLastPathComponent()
+        let name = bfURL.deletingPathExtension().lastPathComponent
+
+        // Match BF8 -> Fluoro8, BF08 -> Fluoro08, etc.
+        if let m = name.range(of: #"^BF(\d+)$"#, options: .regularExpression) {
+            let digits = String(name[m]).replacingOccurrences(of: "BF", with: "")
+            let candidates = [
+                folder.appendingPathComponent("Fluoro\(digits).tif"),
+                folder.appendingPathComponent("Fluoro\(digits).tiff")
+            ]
+            for url in candidates where FileManager.default.fileExists(atPath: url.path) {
+                return url
+            }
+        }
+
+        // Fallback: try replacing a leading BF with Fluoro in the filename stem.
+        if name.hasPrefix("BF") {
+            let replaced = "Fluoro" + name.dropFirst(2)
+            let candidates = [
+                folder.appendingPathComponent("\(replaced).tif"),
+                folder.appendingPathComponent("\(replaced).tiff")
+            ]
+            for url in candidates where FileManager.default.fileExists(atPath: url.path) {
+                return url
+            }
+        }
+
+        return nil
+    }
+
+    private func loadMatchingFluoroPreview(for bfURL: URL) -> UIImage? {
+        guard let fluoroURL = matchingFluoroURL(for: bfURL) else { return nil }
+        return readTiffPreview8bitAutoBC(from: fluoroURL)?.image
     }
 
     // MARK: - Mask ops
@@ -552,6 +631,7 @@ struct PixelMaskPainterRepresentable: UIViewRepresentable {
     @Binding var brushWidthPx: CGFloat
     @Binding var eraserMode: Bool
     @Binding var pencilOnly: Bool
+    @Binding var overlayOpacity: Double
 
     func makeUIView(context: Context) -> PixelMaskPainterView {
         let v = PixelMaskPainterView()
@@ -565,11 +645,11 @@ struct PixelMaskPainterRepresentable: UIViewRepresentable {
         // Refresh the paint closure every update so it always uses current bindings/state.
         uiView.onPaint = { point in
             paint(at: point, viewSize: uiView.bounds.size)
-            uiView.overlayImage = makeMaskOverlayImage(maskW: maskW, maskH: maskH, maskData: maskData)
+            uiView.overlayImage = makeMaskOverlayImage(maskW: maskW, maskH: maskH, maskData: maskData, overlayOpacity: overlayOpacity)
             uiView.setNeedsDisplay()
         }
 
-        uiView.overlayImage = makeMaskOverlayImage(maskW: maskW, maskH: maskH, maskData: maskData)
+        uiView.overlayImage = makeMaskOverlayImage(maskW: maskW, maskH: maskH, maskData: maskData, overlayOpacity: overlayOpacity)
         uiView.setNeedsDisplay()
     }
 
@@ -660,7 +740,7 @@ final class PixelMaskPainterView: UIView {
     }
 }
 
-private func makeMaskOverlayImage(maskW: Int, maskH: Int, maskData: [UInt16]) -> UIImage? {
+private func makeMaskOverlayImage(maskW: Int, maskH: Int, maskData: [UInt16], overlayOpacity: Double) -> UIImage? {
     guard maskW > 0, maskH > 0, maskData.count == maskW*maskH else { return nil }
     let n = maskW * maskH
 
@@ -682,10 +762,11 @@ private func makeMaskOverlayImage(maskW: Int, maskH: Int, maskData: [UInt16]) ->
             }
             let base = i * 4
             let (r,g,b,a) = labelRGBA(v)
+            let scaledAlpha = UInt8(max(0, min(255, Int(round(Double(a) * overlayOpacity)))))
             p[base+0] = r
             p[base+1] = g
             p[base+2] = b
-            p[base+3] = a
+            p[base+3] = scaledAlpha
         }
     }
 
